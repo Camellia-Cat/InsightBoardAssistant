@@ -9,8 +9,6 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@ant-design/plots-vue": "^1.1.7",
-    "@antv/g2plot": "^2.4.35",
     "@mlc-ai/web-llm": "^0.2.77",
     "echarts": "^6.0.0",
     "papaparse": "^5.5.3",
