@@ -1,6 +1,5 @@
 <script setup>
 import { ref, reactive } from 'vue'
-import DataUploader from './components/DataUploader.vue'
 import ChartView from './components/ChartView.vue'
 import ChatPanel from './components/ChatPanel.vue'
 import { buildAnalysisPrompt, chat as chatLLM } from './services/webllm'
@@ -10,6 +9,10 @@ const question = ref('')
 const preset = ref('')
 const result = reactive({ config: {}, insight: '', reason: '', chartType: '' })
 const aiBusy = ref(false)
+const aiThinkingMs = ref(0)
+let aiTimer = null
+let aiController = null
+const lastAnalysisMs = ref(0)
 
 const presets = [
   { label: '同比', value: '同比' },
@@ -27,11 +30,17 @@ function fullQuestion() {
 }
 
 async function runAI() {
-  if (!dataset.value) return
+  if (!dataset.value || aiBusy.value) return
   aiBusy.value = true
+  aiThinkingMs.value = 0
+  if (aiTimer) { clearInterval(aiTimer); aiTimer = null }
+  const startedAt = Date.now()
+  aiTimer = setInterval(() => { aiThinkingMs.value = Date.now() - startedAt }, 50)
+  aiController = new AbortController()
   try {
     const messages = buildAnalysisPrompt({ columns: dataset.value.columns, sampleRows: dataset.value.rows.slice(0, 20), question: fullQuestion() })
-    const text = await chatLLM(messages)
+    const text = await chatLLM(messages, { signal: aiController.signal })
+    lastAnalysisMs.value = Date.now() - startedAt
 
     const parseAIJSON = (t) => {
       if (!t || typeof t !== 'string') return null
@@ -98,7 +107,7 @@ async function runAI() {
       const fence2 = cleaned.match(/```json[\s\S]*?```/i) || cleaned.match(/```[\s\S]*?```/)
       if (fence2) {
         const inner2 = fence2[0].replace(/```json/i, '').replace(/```/g, '').trim()
-        obj = tryParse(inner2) || tryEvalObject(inner2)
+    	obj = tryParse(inner2) || tryEvalObject(inner2)
         if (obj) return reviveFunctions(obj)
       }
       const f2 = cleaned.indexOf('{'); const l2 = cleaned.lastIndexOf('}')
@@ -124,9 +133,19 @@ async function runAI() {
     }
 
     const config = obj.config || obj.option || {}
-    // If model didn't include data, attach dataset rows as data for G2Plot
-    if (!config.data && dataset.value?.rows?.length) {
-      config.data = dataset.value.rows
+    // Ensure ECharts uses the full dataset: inject/override dataset.source with all rows
+    if (dataset.value?.rows?.length) {
+      const fullRows = dataset.value.rows
+      if (Array.isArray(config.dataset)) {
+        // If multiple datasets, replace the first one's source; leave others as-is
+        config.dataset = config.dataset.map((ds, idx) => {
+          const dso = { ...(ds || {}) }
+          if (idx === 0) dso.source = fullRows
+          return dso
+        })
+      } else {
+        config.dataset = { ...(config.dataset || {}), source: fullRows }
+      }
     }
     Object.assign(result, {
       chartType: obj.chartType || '',
@@ -138,7 +157,17 @@ async function runAI() {
     console.error(e)
   } finally {
     aiBusy.value = false
+    if (aiTimer) { clearInterval(aiTimer); aiTimer = null }
+    aiController = null
   }
+}
+
+function cancelAI() {
+  if (aiController) {
+    try { aiController.abort() } catch {}
+  }
+  aiBusy.value = false
+  if (aiTimer) { clearInterval(aiTimer); aiTimer = null }
 }
 
 function applyFromChat(obj) {
@@ -155,8 +184,18 @@ function applyFromChat(obj) {
   }
   const config0 = obj.config || obj.option || {}
   const config = walk(config0)
-  if (!config.data && dataset.value?.rows?.length) {
-    config.data = dataset.value.rows
+  // Ensure ECharts uses full dataset
+  if (dataset.value?.rows?.length) {
+    const fullRows = dataset.value.rows
+    if (Array.isArray(config.dataset)) {
+      config.dataset = config.dataset.map((ds, idx) => {
+        const dso = { ...(ds || {}) }
+        if (idx === 0) dso.source = fullRows
+        return dso
+      })
+    } else {
+      config.dataset = { ...(config.dataset || {}), source: fullRows }
+    }
   }
   Object.assign(result, {
     chartType: obj.chartType || '',
@@ -197,7 +236,7 @@ function exportJSON() {
     </header>
 
     <section class="controls">
-      <DataUploader @loaded="onLoaded" />
+      <!-- 已将上传与 AI 分析集成到右侧聊天框中，这里保留预设与导出功能 -->
       <select v-model="preset" class="select">
         <option value="" disabled>选择预设问题</option>
         <option v-for="p in presets" :key="p.value" :value="p.value">{{ p.label }}</option>
@@ -205,22 +244,31 @@ function exportJSON() {
       <input v-model="question" class="q" placeholder="输入你的问题，如：按月份查看销售额趋势" />
       <button @click="runAI" :disabled="!dataset || aiBusy">AI 分析</button>
       <button @click="exportJSON" :disabled="!dataset">导出仪表盘 JSON</button>
+      <span v-if="lastAnalysisMs" class="dur">上次思考用时 {{ (lastAnalysisMs/1000).toFixed(1) }}s</span>
     </section>
 
-    <section v-if="dataset" class="main">
+    <section class="main">
       <div class="left">
         <div class="insight">
           <div class="t">洞察</div>
-          <div class="c">{{ result.insight || '点击分析生成洞察' }}</div>
+          <div class="c">{{ result.insight || (dataset ? '点击分析生成洞察' : '请先在右侧聊天框上传数据并进行分析') }}</div>
           <div class="t" style="margin-top:8px">图表建议理由</div>
           <div class="c">{{ result.reason || '—' }}</div>
         </div>
         <ChartView :result="result" />
       </div>
       <div class="right">
-        <ChatPanel @apply="applyFromChat" />
+        <ChatPanel @apply="applyFromChat" @loaded="onLoaded" />
       </div>
     </section>
+
+    <div v-if="aiBusy" class="overlay" @click="cancelAI">
+      <div class="loader">
+        <div class="spinner"></div>
+        <div class="txt">AI 分析中... 点击取消</div>
+        <div class="time">已用时 {{ (aiThinkingMs/1000).toFixed(1) }}s</div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -230,6 +278,15 @@ function exportJSON() {
   flex-direction: column;
   gap: 20px;
 }
+.dur { margin-left: 8px; font-size: 12px; opacity: .9; }
+
+/* Loading overlay */
+.overlay { position: fixed; left:0; top:0; right:0; bottom:0; background: rgba(0,0,0,0.45); display:flex; align-items:center; justify-content:center; z-index: 9999; }
+.loader { background: rgba(17,24,39,0.9); padding: 16px 20px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.15); color: #e5e7eb; display:flex; flex-direction: column; align-items:center; gap:6px; }
+.spinner { width: 28px; height: 28px; border: 3px solid rgba(255,255,255,0.25); border-top-color: #60a5fa; border-radius: 50%; animation: spin 1s linear infinite; }
+.txt { font-size: 14px; }
+.time { font-size: 12px; opacity: .85; }
+@keyframes spin { to { transform: rotate(360deg) } }
 
 /* Hero header with gradient glow */
 .top {

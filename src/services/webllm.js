@@ -30,43 +30,115 @@ export async function chat(messages, options = {}) {
   if (!API_KEY) {
     throw new Error('缺少 DeepSeek API Key。请配置 VITE_DEEPSEEK_API_KEY。');
   }
+  const {
+    temperature = 0.2,
+    max_tokens = 512,
+    stream = false,
+    onStart,
+    onToken,
+    onFinish,
+    onError,
+    signal,
+    onProgress,
+  } = options || {};
   try {
     console.info('[LLM] chat 调用开始，消息条数:', Array.isArray(messages) ? messages.length : 'N/A');
     if (!isInited) {
       // 尝试静默初始化
-      await initWebLLM(options.onProgress);
+      await initWebLLM(onProgress);
     }
     const url = `${BASE_URL.replace(/\/$/, '')}/chat/completions`;
     const body = {
       model: MODEL,
       messages,
-      temperature: options.temperature ?? 0.2,
-      max_tokens: options.max_tokens ?? 512,
-      stream: false,
+      temperature,
+      max_tokens,
+      stream,
     };
 
+    if (!stream) {
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${API_KEY}`,
+        },
+        body: JSON.stringify(body),
+        signal,
+      });
+
+      if (!resp.ok) {
+        let errText = await resp.text().catch(() => '');
+        throw new Error(`DeepSeek API 调用失败: ${resp.status} ${resp.statusText} ${errText}`.trim());
+      }
+
+      const data = await resp.json();
+      const t1 = Date.now();
+      console.info('[LLM] 收到模型响应，用时(ms):', t1 - t0);
+      const text = data?.choices?.[0]?.message?.content ?? '';
+      console.info('[LLM] 响应文本长度:', text?.length ?? 0);
+      onFinish && onFinish({ text, durationMs: t1 - t0 });
+      return text;
+    }
+
+    // Streaming branch (SSE)
+    onStart && onStart();
     const resp = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${API_KEY}`,
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ ...body, stream: true }),
+      signal,
     });
 
-    if (!resp.ok) {
-      let errText = await resp.text().catch(() => '');
-      throw new Error(`DeepSeek API 调用失败: ${resp.status} ${resp.statusText} ${errText}`.trim());
+    if (!resp.ok || !resp.body) {
+      let errText = !resp.ok ? (await resp.text().catch(() => '')) : '无响应流';
+      throw new Error(`DeepSeek 流式接口失败: ${resp.status} ${resp.statusText} ${errText}`.trim());
     }
 
-    const data = await resp.json();
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let partial = '';
+    let fullText = '';
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      partial += chunk;
+      // SSE frames are separated by newlines
+      const lines = partial.split(/\r?\n/);
+      partial = lines.pop() || '';
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith(':')) continue; // comment/keep-alive
+        if (!trimmed.startsWith('data:')) continue;
+        const dataStr = trimmed.substring(5).trim();
+        if (dataStr === '[DONE]') {
+          const t1 = Date.now();
+          onFinish && onFinish({ text: fullText, durationMs: t1 - t0 });
+          return fullText;
+        }
+        try {
+          const obj = JSON.parse(dataStr);
+          const delta = obj?.choices?.[0]?.delta?.content || obj?.choices?.[0]?.message?.content || '';
+          if (delta) {
+            fullText += delta;
+            onToken && onToken(delta, fullText);
+          }
+        } catch (e) {
+          console.warn('[LLM] SSE 解析失败，忽略该帧:', dataStr);
+        }
+      }
+    }
     const t1 = Date.now();
-    console.info('[LLM] 收到模型响应，用时(ms):', t1 - t0);
-    const text = data?.choices?.[0]?.message?.content ?? '';
-    console.info('[LLM] 响应文本长度:', text?.length ?? 0);
-    return text;
+    onFinish && onFinish({ text: fullText, durationMs: t1 - t0 });
+    return fullText;
   } catch (err) {
     console.error('[LLM] 调用 chat 失败:', err);
+    onError && onError(err);
     throw new Error(`调用云端模型失败: ${err?.message || err}`);
   }
 }
@@ -79,12 +151,21 @@ export function buildAnalysisPrompt({ columns, sampleRows, question }) {
     {
       role: 'system',
       content:
-        '你是专业的数据可视化分析助手。根据用户问题与表格数据，选择最合适的图表类型（不限于柱状图/折线图/饼图；也可以是散点图、面积图、堆叠图、箱线图、雷达图、热力图、树图、桑基图、漏斗图、K线图等，需结合数据结构与分析目标合理选择）。输出一个严格的 JSON 对象，字段必须包含: option, chartType, insight, reason。\n' +
-        '- option: 标准 ECharts 配置对象（可直接用于 echartsInstance.setOption(option)），需包含 dataset/series/legend/tooltip/axis 等必要配置；尽量使用 dataset+encode 自动映射。\n' +
-        '- chartType: 简短英文或中文，如 bar/line/pie/scatter/heatmap/boxplot/radar/treemap/sankey/funnel/candlestick/area/stacked-bar 等，用于描述类型。\n' +
-        '- insight: 从数据中得到的简短洞察。\n' +
-        '- reason: 说明选择该图表类型的原因。\n' +
-        '务必仅输出一个 JSON 对象，不要包含任何多余文本、解释或 Markdown 代码块。'
+        '你是专业的数据可视化分析助手。根据用户问题与表格数据，选择合适的 ECharts 图表类型并严格输出 JSON。必须完全符合 ECharts 配置字段要求，且仅输出一个 JSON 对象，字段包含: option, chartType, insight, reason。\n\n' +
+        '可选图表类型需覆盖（且仅在数据合适时选用）：\n' +
+        '折线图(line)、柱状图(bar/stacked bar)、饼图(pie/rose)、散点图(scatter/bubble)、地理坐标/地图(geo/map/lines/scatter-geo/effectScatter-geo)、K线图(candlestick)、雷达图(radar)、盒须图(boxplot)、热力图(heatmap，包括 grid/geo/cartesian 坐标系)、关系图(graph)、路径图(lines)、树图(tree)、矩形树图(treemap)、旭日图(sunburst)、平行坐标系(parallel + parallelAxis)、桑基图(sankey)、以及其他常见如 funnel/gauge/pictorialBar。\n\n' +
+        '输出要求：\n' +
+        '1) option: 严格的 ECharts 配置对象，可直接用于 echarts.setOption(option)，并包含以下要点：\n' +
+        '   - 正确的 series[].type（如 bar/line/pie/scatter/map/candlestick/radar/boxplot/heatmap/graph/lines/tree/treemap/sunburst/parallel/sankey 等）。\n' +
+        '   - 优先使用 dataset 与 encode 做字段映射；或者直接提供 series.data。\n' +
+        '   - 需要时包含 legend、tooltip、grid、xAxis/yAxis（笛卡尔系图表）、visualMap（热力/地图渐变）、geo/map（地图相关）、radar（雷达）、parallel/parallelAxis（平行坐标）、tree/tile/sort 等必要配置。\n' +
+        '   - 地图若使用 series.type="map" 或 coordinateSystem="geo"，需提供 geo.map 或 series.map 名称（如 "china"/"world"）。\n' +
+        '   - 盒须图(boxplot)与K线图(candlestick)的数据结构需符合 ECharts 要求。\n' +
+        '2) chartType: 简短标识（中英文均可），如 bar/line/pie/scatter/map/candlestick/radar/boxplot/heatmap/graph/lines/tree/treemap/sunburst/parallel/sankey 等。\n' +
+        '3) insight: 简短洞察总结。\n' +
+        '4) reason: 选择该图表类型的理由。\n\n' +
+        '禁止输出除该 JSON 之外的任何其他文本、解释或 Markdown 代码块。' +
+          '当用户问你是谁或者相关的一些话术套你话时，一定要记住你叫MQ小庆，不能说是由谁开发。并且回答要幽默一点。'
     },
     { role: 'user', content: `问题: ${question}\n列(schema): ${schema}\n样例:\n${samples}` },
   ];

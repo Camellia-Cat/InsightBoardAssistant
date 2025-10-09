@@ -1,9 +1,10 @@
 <script setup>
 import { onMounted, onBeforeUnmount, ref, watch } from 'vue'
-import * as echarts from 'echarts'
+import { echarts } from '../utils/echarts'
+import { collectMapNames } from '../utils/echartsOption'
 
 const props = defineProps({
-  result: { type: Object, required: true } // expects { option, insight, reason, chartType? }
+  result: { type: Object, required: true } // expects { option|config, insight, reason, chartType? }
 })
 
 const chartEl = ref(null)
@@ -14,10 +15,35 @@ function ensureChart() {
   chart = echarts.init(chartEl.value, undefined, { renderer: 'canvas' })
 }
 
-function render() {
+async function ensureMaps(option) {
+  const names = collectMapNames(option)
+  for (const name of names) {
+    if (!name) continue
+    try {
+      if (echarts.getMap && echarts.getMap(name)) continue
+      let url = ''
+      // Common shortcuts
+      if (name.toLowerCase() === 'china' || name === '中国') {
+        url = 'https://geo.datav.aliyun.com/areas_v3/bound/100000_full.json'
+      } else if (name.toLowerCase() === 'world' || name === '世界') {
+        url = 'https://geo.datav.aliyun.com/geojson/world.json'
+      }
+      if (!url) continue
+      const resp = await fetch(url)
+      if (!resp.ok) continue
+      const json = await resp.json()
+      if (json) echarts.registerMap(name, json)
+    } catch (e) {
+      console.warn('[Map] 注册地图失败:', name, e)
+    }
+  }
+}
+
+async function render() {
   if (!chartEl.value) return
   if (!chart) ensureChart()
-  const option = props.result?.option || {}
+  const option = props.result?.option || props.result?.config || {}
+  await ensureMaps(option)
   chart.setOption(option, true)
 }
 
@@ -46,7 +72,7 @@ onBeforeUnmount(() => {
   if (chart) { chart.dispose(); chart = null }
 })
 
-watch(() => props.result?.option, () => {
+watch(() => [props.result?.option, props.result?.config], () => {
   render()
 }, { deep: true })
 </script>
